@@ -1,0 +1,442 @@
+---
+title: "TP3 Systèmes de Recommandations"
+author: "Corentin Lacroix, Léa Boisdur"
+date: "20 novembre 2016"
+output: html_document
+---
+
+##0. Utility functions and data integration
+
+```{r}
+library(Matrix)
+library(RCurl)
+
+#0.a Utiliy functions
+cosinus.m <- function(m) {
+  ans <- t(m) %*% m
+  m.norms <- sqrt(colSums(m^2, na.rm=TRUE))
+  ans <- ans/m.norms
+  ans <- ans %*% diag(1/m.norms)
+  return(ans)
+  }
+
+u.data <- read.csv(file='./data/u.data.csv', sep='|', header=T)
+m <- sparseMatrix(u.data[,1],u.data[,2],x=u.data[,3])
+rownames(m) <- paste('u', 1:nrow(m), sep='')
+colnames(m) <- paste('i', 1:ncol(m), sep='')
+m <- as.matrix(m)
+p <- dim(m)[1] # Number of users
+n <- dim(m)[2] # Number of items
+
+## Construct matrices equivalent to m with NAs
+m.na <- m
+m.na[m==0] <- NA
+```
+
+##1. Point de comparaison pour la prédiction des votes
+
+Nous avons testé pour cette question 2 méthodes : 
+- pour chaque couple (u,i), la prédiction du rating correspondant est la moyenne des votes donnés par l'utilisateur u
+- pour chaque couple (u,i), la prédiction du rating correspondant est la moyenne des votes donnés à l'item i
+
+Nous avons testé ces méthodes par Cross Validation pour obtenir des estimateurs non biaisées des performances. Une subtilité apparait dans ce cas la : certains items/users ont peu de votes ; ainsi le fait de retirer certaines observations peut empecher le calcul de la moyenne des votes (par user ou item) car il n'y a plus d'observations. Certaines ratings du test set ne peuvent ainsi être prédits.
+
+
+La méthode basée sur la moyenne des votes données à l'item semble légèrement meilleure. 
+
+```{r}
+# 1. Implement a naïve vote prediction methods and estimate rmse mae by cross validation :
+# a. cv_av_colmean : Set predicted rating for (user, item) to item average given rating
+
+# Construct array indices containing couples (indices[k,1], indices[k,2]) for which a rating was observed.
+indices <- which(m >= 1, arr.ind=T)
+indices <- indices[sample(nrow(indices)),]
+n_fold <- 5
+
+cv_av_colmean <- function(m, n_fold, observations) {
+  
+  n_obs <- nrow(observations)
+  fold_size = n_obs %/% n_fold
+  mae <- 0
+  rmse <- 0
+  
+  # Compute columns means vector and na indices
+  na_obs <- which(is.na(m), arr.ind=TRUE)
+  
+  for (k in seq(0, n_fold-1)) {
+    
+    print(paste("Computing Error for test set ", toString(k+1)))
+    test_obs <- observations[seq(k*fold_size, ((k + 1) * fold_size - 1)),]
+    train_obs <- observations[-seq(k*fold_size, ((k + 1) * fold_size - 1)),]
+    
+    # Compute items means with train observations only 
+    # (ratings for test observations are set to NAN and not taken into account in average computation)
+    m_train <- m
+    m_train[test_obs] <- NA
+    cM <- colMeans(m_train, na.rm=TRUE)
+    
+    # Compute matrix cotaining predicted vote (if possible) for test observations
+    # and NAN values for all others (train observations, unobserved ratings, test observations
+    # that couldn't be predicted because absence of corresponding item average rating)
+    m_test.pred <- m
+    m_test.pred[test_obs] <- cM[test_obs[,2]] # Set all test ratings to items means in the train matrix
+    m_test.pred[train_obs] <- NA # Set all train ratings to NA in this prediction matrix
+    
+    # Compute number of effective predictions, mae and rmse  
+    n_pred_votes <- length(m) - sum(colSums(is.na(m-m_test.pred), na.rm=TRUE))
+    mae <- mae + sum(colSums(abs(m - m_test.pred), na.rm = TRUE))/n_pred_votes
+    rmse <- rmse + sqrt(sum(colSums((m - m_test.pred)^2, na.rm = TRUE))/n_pred_votes)
+  }
+  
+  mae <- mae/n_fold
+  rmse <- rmse/n_fold
+  
+  # Free memory
+  rm(m_train)
+  rm(m_test.pred)
+  
+  return(list(mae_er=mae, rmse_er=rmse))
+}
+
+naive_errors_colmean <- cv_av_colmean(m.na, 5, indices)
+print(paste("RMSE is ", naive_errors_colmean$rmse_er))
+print(paste("MAE is ", naive_errors_colmean$mae_er))
+
+# b. cv_av_rowmean Set predicted rating for (user, item) to user average rating
+
+cv_av_rowmean <- function(m, n_fold, observations) {
+  
+  n_obs <- nrow(observations)
+  fold_size = n_obs %/% n_fold
+  mae <- 0
+  rmse <- 0
+  
+  # Compute columns means vector and na indices
+  na_obs <- which(is.na(m), arr.ind=TRUE)
+  
+  for (k in seq(0, n_fold-1)) {
+    
+    print(paste("Computing Error for test set ", toString(k+1)))
+    test_obs <- observations[seq(k*fold_size, ((k + 1) * fold_size - 1)),]
+    train_obs <- observations[-seq(k*fold_size, ((k + 1) * fold_size - 1)),]
+    
+    # Compute items means with train observations only 
+    # (ratings for test observations are set to NAN and not taken into account in average computation)
+    m_train <- m
+    m_train[test_obs] <- NA
+    cR <- rowMeans(m_train, na.rm=TRUE)
+    
+    # Compute matrix cotaining predicted vote (if possible) for test observations
+    # and NAN values for all others (train observations, unobserved ratings, test observations
+    # that couldn't be predicted because absence of corresponding user average rating)
+    m_test.pred <- m
+    m_test.pred[test_obs] <- cR[test_obs[,1]] # Set all test ratings to items means in the train matrix
+    m_test.pred[train_obs] <- NA # Set all train ratings to NA in this prediction matrix
+    
+    # Compute number of effective predictions, mae and rmse  
+    n_pred_votes <- length(m) - sum(colSums(is.na(m-m_test.pred), na.rm=TRUE))
+    mae <- mae + sum(colSums(abs(m - m_test.pred), na.rm = TRUE))/n_pred_votes
+    rmse <- rmse + sqrt(sum(colSums((m - m_test.pred)^2, na.rm = TRUE))/n_pred_votes)
+  }
+  
+  mae <- mae/n_fold
+  rmse <- rmse/n_fold
+  
+  # Free memory
+  rm(m_train)
+  rm(m_test.pred)
+  
+  return(list(mae_er=mae, rmse_er=rmse))
+}
+
+naive_errors_rowmean <- cv_av_rowmean(m.na, 5, indices)
+print(paste("RMSE is ", naive_errors_rowmean$rmse_er))
+print(paste("MAE is ", naive_errors_rowmean$mae_er))
+
+```
+
+##2,3,4. Appliquer la décomposition SVD
+
+  Pour cette question et certaines suivantes, il était demandé de normaliser les données. Nous avons dans un premier temps pensé à normaliser les colonnes/lignes afin que celles-ci aient une moyenne de 0 et variance de 1 (scaling) mais cela revient alors à appliquer la méthode PCA (Principal Component Analysis) et après discussion nous avons su que cette opération n'était pas nécessaire. Par ailleurs, appliquer une normalisation linéaire des données afin que les ratings soient compris entre 0 et 1 ou -1 et 1 ne changent en rien les résultats de la décomposition (mais peuvent influencer les calculs). Pour les questions suivantes (cross validation), ce que nous avons fait revient indirectement à transformer les données afin que celles-ci aient une moyenne de 0 et leur appliquer svd.    
+
+```{r}
+# Svd decomposition with k = min(n,p)
+m.svd <- svd(m)
+```
+
+
+  La méthode SVD native de R ne peut appliquer la décomposition qu'aux matrices numériques sans valeurs nulles. Il nous a donc fallu faire un choix concernant le remplissage des valeurs nulles de la matrice UI. Ici, nous avons choisi de modifier légèrement la matrice à laquelle est appliquée la décomposition SVD : nous remplissons artificiellement les valeurs nulles (ratings non observés) de la matrice UI des votes par les moyennes des colonnes (la méthode de la moyenne des colonnes ou item s'est avérée meilleure lors de la question 1). 
+Nous nous sommes rendus compte que cette méthode (comme précisé dans l'article de Sarwar et al. 2000) permettait d'améliorer drastiquement les performances de la méthode SVD.
+
+
+  D'après la littérature, ceci n'est pas la meilleure méthode pour estimer des votes à partir de la décomposition SVD mais en constitue seulement la première étape. En effet, il faudrait ensuite réappliquer la décomposition SVD à la matrice recomposée et répéter itérativement cette opération jusqu'à convergence (m et sa recomposition svd sont identiques). Ceci ressemble fortement à l'algorithme EM. Nous n'avons pas implémenté cette méthode car complexe et très largement hors du périmètre de ce TP.
+  
+
+  Pour estimer les votes en utilisant seulement 10 facteurs latents, il faut reconstruire la matrice initiale à partir de troncatures des matrices u, v et d. Il faut ensuite ramener ces votes dans l'intervalle [0,5]. Le calcul des grandeurs rmse et mae est alors possible. Les estimations des performances des modèles sont ici biaisées et optimistes : l'erreur est calculée d'après les observations qui ont permis d'entrainer le modèle.
+
+
+
+```{r}
+# We compute NA observations in m.na matrix and set its unobserved ratings to 
+# the columns average (item average observed ratings)
+na_obs <- which(is.na(m.na), arr.ind=TRUE)
+cM <- colMeans(m.na, na.rm=TRUE)
+m.normalized <- m.na
+m.normalized[na_obs] <-cM[na_obs[,2]] 
+
+# SVD decomposition with k = 10
+m.svd.10 <- svd(m.normalized, nu=10, nv=10)
+
+# Compute reconstruction of m
+m.reconstructed <- m.svd.10$u %*% diag(m.svd.10$d[1:10]) %*% t(m.svd.10$v)
+
+# Scale result to [0,5]
+m.reconstructed[m.reconstructed > 5] <- 5
+m.reconstructed[m.reconstructed < 0] <- 0
+
+# Compute absolute Mean Error and RMSE
+n_votes <- sum(colSums(ifelse(m == 0,0,1)))
+mae <- sum(colSums(abs(m.na - m.reconstructed), na.rm = TRUE))/n_votes
+rmse <- sqrt(sum(colSums((m.na - m.reconstructed)^2, na.rm = TRUE))/n_votes)
+print(paste("RMSE is ", rmse))
+print(paste("MAE is ", mae))
+```
+
+
+##5. Déterminez le nombre de dimensions optimal sans Cross Validation
+
+  Théoriquement, plus la complexité du modèle (ici le nombre de dimensions utilisées dans la reconstruction) est importante, plus l'estimation de l'erreur moyenne du modèle sur l'ensemble d'entrainement sera faible. L'estimation de l'erreur moyenne sur un ensemble de test sera importante lorsque la complexité du modèle est faible (underfitting), importante lorsque la complexité du modèle est grande (overfitting) et minimale pour une "bonne" complexité.
+  
+  
+```{r}
+dims <- append(seq(2,min(n,p),5), c(min(n,p)))
+m.svd <- svd(m.normalized)
+
+rmse_vec <- rep(0,length(dims))
+abser_vec <- rep(0,length(dims))
+
+for (k in c(1:length(dims))) {
+  dim = dims[k]
+  m.reconstructed <- m.svd$u[,1:dim] %*% diag(m.svd$d[1:dim]) %*% t(m.svd$v[,1:dim]) # reconstruct original matrix
+  
+  # Scale votes to [1,5]
+  m.reconstructed[m.reconstructed > 5] <- 5
+  m.reconstructed[(m.reconstructed < 1) & (m.reconstructed > 0)] <- 1
+  
+  # Compute MAE and RMSE
+  abser_vec[k] <- sum(colSums(abs(m.na - m.reconstructed), na.rm = TRUE))/n_votes
+  rmse_vec[k] <- sqrt(sum(colSums((m.na - m.reconstructed)^2, na.rm = TRUE))/n_votes)
+}
+
+plot(dims, rmse_vec, main="RMSE of SVD Prediction method vs reconstruction dimension", ylab="RMSE", xlab="Dimension")
+plot(dims, abser_vec, main="MAE of SVD Prediction method vs reconstruction dimension", ylab="MAE", xlab="Dimension")
+
+```
+
+  
+  
+  
+  Sans surprises, plus la complexité du modèle est importante, plus l'estimation utilisée ici de l'erreur est faible. Elle est même de 0 pour la complexité maximale : la matrice est alors parfaitement reconstituée.
+  
+  
+  
+##6. Estimation des erreurs par Cross Validation
+
+```{r}
+
+cv_svd_colmean <- function(m, n_fold, observations, dims) {
+  
+  n_obs <- nrow(observations)
+  fold_size = n_obs %/% n_fold
+  rmse_vec <- rep(0, length(dims))
+  abser_vec <- rep(0, length(dims))
+  
+  # Compute columns means vector and na indices
+  na_obs <- which(is.na(m), arr.ind=TRUE)
+  
+  for (k in seq(0, n_fold-1)) {
+    
+    print(paste("Computing Error for test set ", toString(k+1)))
+    test_obs <- observations[seq(k*fold_size, ((k + 1) * fold_size - 1)),]
+    train_obs <- observations[-seq(k*fold_size, ((k + 1) * fold_size - 1)),]
+    m_train <- m
+    
+    # Compute items means with train observations only
+    tmp_m <- m
+    tmp_m[test_obs] <- NA
+    cM <- colMeans(tmp_m, na.rm=TRUE)
+    rm(tmp_m)
+    
+    # Set all test ratings to items means in the train matrix
+    m_train[test_obs] <- cM[test_obs[,2]]
+    m_train[na_obs] <- cM[na_obs[,2]]
+    
+    # Set all restant NA values to 0 (ratings for movies unobserved in train observations)
+    m_train[is.na(m_train)] <- 0
+    
+    # Compute SVD decomposition for the train matrix
+    m_train.svd <- svd(m_train)
+    
+    # Predict test votes using SVD recompoistion with different number of dimensions
+    for (j in c(1:length(dims))) {
+      dim = dims[j]
+      
+      # Construct SVD recomposition based on dim dimensions
+      m_train.rec <- m_train.svd$u[,1:dim] %*% diag(m_train.svd$d[1:dim]) %*% t(m_train.svd$v[,1:dim])
+      
+      #Construct matrix containing predicted vote for test observations 
+      # and NA for all others (train observations or no observation)
+      m_test.pred <- m_train.rec
+      m_test.pred[train_obs] <- NA # set all train ratings to NA
+      m_test.pred[na_obs] <- NA # set all unobserved ratings to NA
+      m_test.pred[, is.na(cM)] <- NA # set all ratings corresponding to movies unobserved in train set to NA
+      m_test.pred[m_test.pred > 5] <- 5 # scale all values > 5 to 5
+      m_test.pred[m_test.pred < 1] <- 1 # scale all values < 1 to 1
+      
+      # Compute number of predicted votes, MAE and RMSE
+      n_pred_votes <- length(m) - sum(colSums(is.na(m-m_test.pred), na.rm=TRUE))
+      abser_vec[j] <- abser_vec[j] + sum(colSums(abs(m - m_test.pred), na.rm = TRUE))/n_pred_votes
+      rmse_vec[j] <- rmse_vec[j] + sqrt(sum(colSums((m - m_test.pred)^2, na.rm = TRUE))/n_pred_votes)
+    }
+  }
+  abser_vec <- abser_vec/n_fold
+  rmse_vec <- rmse_vec/n_fold
+  return(list(rmse=rmse_vec, abs=abser_vec))
+}
+
+# Test function with n_fold=5
+
+n_fold <- 5
+dims <- append(seq(2,30,1), seq(30, min(n,p), 30))
+errors <- cv_svd_colmean(m.na, 5, indices, dims)
+plot(dims, errors$rmse, main="RMSE of SVD Prediction method vs reconstruction dimension", ylab="RMSE", xlab="Dimension")
+plot(dims, errors$abs, main="MAE of SVD Prediction method vs reconstruction dimension", ylab="MAE", xlab="Dimension")  
+```
+
+
+  Ainsi la Cross Validation nous permet d'établir que le meilleur modèle de prédiction est celui obtenu avec une dimension de 13 à la fois au sens de l'erreur RMSE que MAE. L'erreur RMSE est de 0.9758 est MAE de 0.7721, ce qui est meilleur que les résultats des approches naïves implémentées à la première question.
+
+
+  Par ailleurs, on constate que l'erreur du modèle (RMSE et MAE) tend vers l'erreur obtenue par la méthode naîve (moyenne des ratings des items) : c'est normal. Lorsque la dimension tend vers sa dimension maximale, on reconstruit alors parfaitement la matrice initiale ... qui contenait (pour les ratings à prédire) les moyennes des ratings des items correspondant !
+
+
+
+##7. Comparaison de la méthode SVD avec une approche collaborative de type item-item
+
+
+
+  Pour cette question, nous avons choisi l'approche implémentée pour le TP1 qui fonctionnait le mieux : l'approche item-item basée sur la distance euclidienne pour determiner le voisinage des items et les poids cosinus (distance cosinus) pour le calcul pondéré des votes prédits.
+  
+  Dans un premier temps, nous avions essayé de rendre le code et les calculs les plus compacts possibles mais les erreurs retournées par l'algorithme n'étaient pas cohérentes. Dans un second temps, nous avons tenté une autre approche et remplacé une partie de ce code par 1 boucle for pour calculer :
+
+- pour chaque observation du test set, le vote prédit par l'approche ainsi que l'erreur quadratique et absolue de la prédiction
+
+Autres spécificités de notre méthode : 
+
+- dans notre code, les distances cosinus entre tous les items sont calculées. Ces 
+- dans le calcul des plus proches voisins d'un item, un item peut être plus proche voisin d'un autre si ils ont au moins 4 utilisateurs ont voté pour les 2 items
+
+- un vote pour un couple (u,i) peut être prédit si l'utilisateur u a donné au moins 2 votes à un item de V(i) qui est le voisinage de i
+
+- lorsqu'un vote pour un couple (u,i) du test set n'a pas pu être prédit, la valeur moyenne des ratings de l'item est la prédiction pour ce vote
+
+Ceci a pour effet de réduire considérablement la proportion de prédictions effectives de l'approche item-item seule : seuls les votes "surs" sont prédits. La méthode prenant un certain temps à s'executer, elle ne s'execute pas par défaut dans notre code.
+
+```{r}
+
+cv_item_nn <- function(m, n_fold, observations, n_neighbors) {
+  
+  n_obs <- nrow(observations)
+  fold_size = n_obs %/% n_fold
+  mae <- 0.0
+  rmse <- 0.0
+  
+  # Compute and na indices a
+  na_obs <- which(is.na(m), arr.ind=TRUE)
+  
+  m.0s <- m
+  m.0s[is.na(m)] <- 0.0
+  
+  # Compute matrix of common votes
+  print("Computing common votes matrix...")
+  movies.commonvotes <- ((t(m.0s) >= 1) + 0) %*% ((m.0s >= 1) + 0)
+  diag(movies.commonvotes) <- rep(0,ncol(m))
+  
+  for (k in seq(0, n_fold-1)) {
+    
+    print(paste("Computing Error for test set ", toString(k+1)))
+    test_obs <- observations[seq(k*fold_size, ((k + 1) * fold_size - 1)),]
+    train_obs <- observations[-seq(k*fold_size, ((k + 1) * fold_size - 1)),]
+    
+    # Construct train matrix (filled with NAs or 0s)
+    m_train <- m
+    m_train[test_obs] <- NA
+    m_train.0s <- m.0s
+    m_train.0s[test_obs] <- 0.0
+    
+    # Compute columns average
+    cM <- colMeans(m_train, na.rm=TRUE)
+    
+    # Compute distance matrix and commonvotes matrix with 0s diagonal
+    print("Computing distance matrix...")
+    dist_mat <- as.matrix(dist(t(m_train))) # on NAs matrix to get exact distance
+    
+    # Construct cosinus weights matrix with 0s on diagonal
+    print("Computing cosinus weights matrix...")
+    m_train.cos <- cosinus.m(m_train.0s) #on 0s matrix to avoid propagating NAs
+    diag(m_train.cos) <- 0.0 # 
+    
+    # Set all weights m_train.cos[i1,i2] to 0 if i2 doesn't belong to i1 NN
+    print("Reducing non neighbors cosinus weights matrix to 0...")
+    for (movie in seq(1,ncol(m))) {
+      dist_vector <- dist_mat[, movie]
+      dist_vector[which(movies.commonvotes[, movie] < 3)] <- 10000 # set all distances between movie and i to 10000 if less than 4 common votes
+      dist_vector <- sort(dist_vector)
+      m_train.cos[tail(names(dist_vector), n=-n_neighbors), movie] <- 0.0
+    }
+    m_train.cos[is.na(m_train.cos)] <- 0.0 # cosinus.mm fct could have introduced NAs values resulting from 0 division
+    
+    # Compute MAE and RMSE for all observations
+    n_pred_vote <- 0
+    for (j in c(1:nrow(test_obs))) {
+      user <- test_obs[j,1]
+      item <- test_obs[j,2]
+      # Compute 0/1 vector with 1 for item NN
+      item.nn_movies <- ifelse(m_train.cos[,item] > 0,1,0)
+      # Compute 0/1 vector for item user has voted for in train set
+      user.votes <- ifelse(m_train.0s[user,] > 0,1,0)
+      user.nnmovies_rated <- user.votes %*% item.nn_movies # the number of movies in item nn our user has given rating
+      if (user.nnmovies_rated >= 2) {
+        n_pred_vote <- n_pred_vote + 1
+        pred_vote <- (m_train.0s[user,] %*% m_train.cos[,item])[1,1]
+        pred_vote <- pred_vote/(user.votes %*% m_train.cos[,item])
+        mae <- mae + abs(m.na[user,item]-pred_vote)
+        rmse <- rmse + ((m.na[user,item]-pred_vote)^2)
+        
+      } else if (!(is.na(cM[item]))) {
+        n_pred_vote <- n_pred_vote + 1
+        pred_vote <- cM[item]
+        mae <- mae + abs(m.na[user,item]-pred_vote)
+        rmse <- rmse + ((m.na[user,item]-pred_vote)^2)
+      } 
+      
+
+    }
+    mae <- mae/n_pred_vote
+    rmse <- sqrt(rmse/n_pred_vote)
+  }
+  mae <- mae/n_fold
+  rmse <- rmse/n_fold
+  return(list(mae_er=mae, rmse_er=rmse))
+}
+
+#colfilter_errors <- cv_item_nn(m.na, 5, indices, 20)
+```
+
+
+
+  Les performances de cette approche sont 0.215 (RMSE) et 0.169 (MAE). Ce résultat est très etonnant et indique probablement une erreur persistante dans le code. Environ 1/4 des votes seulement ont pu être prédit en moyenne par l'approche collaborative filtering et cette configuration (le reste des prédictions est la moyenne des votes des items). Il est probable que cette approche soit meilleure que l'approche SVD pour les votes prédits "surs" qu'elle produit et moins bonne pour les autres votes prédits (par la moyenne des items).
+
+
+
+  Par ailleurs, certains paramètres de notre implémentation influencent très certainement les résultats de la prédiction (nombre minimal de vote en commun pour les voisinages, etc.). Ils pourraient également être sujet à une optimisation par validation croisée mais nous n'avons pas réalisé cela ici.
